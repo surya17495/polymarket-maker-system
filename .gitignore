@@ -1,0 +1,32 @@
+# --- live capture runtime state (binary, growing, not commit-worthy) ---
+state/raw_events.jsonl
+state/phase1a_*.log
+state/dashboard.log
+state/candidates_ranked*.parquet
+state/candidates_ranked_test.parquet
+state/snapshot_*
+
+# --- dynamically-generated artifacts read at lab runtime; committed authors may include samples ---
+# state/lab/* is INCLUDED in this commit as reference empirical evidence of the lab pipeline.
+# state/pair_map.parquet is INCLUDED (small; re-buildable on demand).
+# state/latency_summary.json + state/phase1a_run_summary.json are INCLUDED (small JSON snapshots).
+
+# ---管理体系 ---
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- secrets / env files ---
+.env
+.env.*
+secrets/
+*.pem
+*.json_key
+*.key
+
+# --- editor / OS cruft ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

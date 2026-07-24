@@ -1,0 +1,88 @@
+allocator:
+  max_concurrent_markets: 15
+  per_market_cap_usd_phase1a: 50
+  per_market_cap_usd_phase2a: 50
+kill_switches:
+  drawdown_halt_pct: 3.0
+  drawdown_reduce_pct: 2.0
+  drawdown_warn_pct: 1.0
+  max_adverse_selection_bps: 600
+  max_inventory_per_market_usd: 50
+  max_quote_lag_ms: 30000
+  max_total_inventory_usd: 200
+  min_credit_score: 0.3
+  paper_deployed_per_market_usd: 50
+  paper_total_deployed_usd: 200
+  tail_bleeder_per_market_x_daily_capture: 4
+paper_trader:
+  candidates_path: state/candidates_ranked.parquet
+  capture_horizon_h: 48
+  cycle_log_path: state/cycles.parquet
+  daily_summary_path: state/daily_summary.parquet
+  fill_log_path: state/ledger.parquet
+  ts_log_path: state/raw_events.jsonl
+phase_gates:
+  phase_1a_pass_all:
+  - median_paper_realized_per_market_per_day_usd >= 5
+  - as_drag_per_fill_bps <= 600
+  - median_inventory_hold_pct < 30
+  - loop_a_score_correl_24h >= 0.30
+  - inventory_drift_pct_in_exit_markets < 2
+scanner:
+  book_endpoint: https://clob.polymarket.com/book
+  events_endpoint: https://gamma-api.polymarket.com/events
+  gamma_max_events: 1200
+  gamma_page_size: 100
+  min_inside_depth_usd: 0.5
+  min_spread_c: 0.5
+  pass_count_top: 30
+  prices_hist_endpoint: https://clob.polymarket.com/prices-history
+  req_parallelism: 20
+  req_timeout_sec: 8
+  scan_cycle_sec: 300
+  trades_endpoint: https://clob.polymarket.com/trades
+  vol_24h_max_usd: null
+  vol_24h_min_usd: 1000.0
+  ws_probe_sec: 15
+  ws_probe_top_n: 50
+score:
+  as_factor_by_topic:
+    commodity: 0.45
+    crypto: 0.5
+    default: 0.5
+    esports: 0.4
+    geopolitics: 0.3
+    macro: 0.45
+    politics: 0.25
+    weather: 0.7
+  base_opportunity_divisor: 50
+  fee_type_map:
+    crypto_fees_v2: 0.9
+    culture_fees: 0.85
+    default: 0.85
+    finance_prices_fees: 0.9
+    mentions_fees: 0.85
+    sports_fees_v2: 0.95
+    tech_fees: 0.75
+  res_brackets:
+    else: 0.5
+    under_0_25d: 2.0
+    under_180d: 0.7
+    under_1d: 1.5
+    under_30d: 1.0
+    under_7d: 1.2
+    under_90d: 0.85
+  weights:
+    as_factor: 1.0
+    balance_factor: 1.0
+    fee_factor: 1.0
+    neg_risk_factor: 1.0
+    res_factor: 1.0
+ws:
+  connect_timeout_sec: 15
+  heartbeat_ping_sec: 20
+  per_token_buffer_msgs: 5000
+  reconnect_backoff_sec: 2
+  reconnect_max_backoff_sec: 60
+  recv_timeout_sec: 8
+  url: wss://ws-subscriptions-clob.polymarket.com/ws/market
