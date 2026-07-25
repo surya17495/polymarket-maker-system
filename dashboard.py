@@ -70,7 +70,33 @@ def gather_state() -> dict:
     except Exception as e:
         out["candidates_top20_error"] = str(e)
 
-    # ledger.parquet — last 10 fills
+    # Phase 1A in-memory fills count (from running PID's run_summary.json)
+    # Surfaces the LIVE `completed_fills_count` even before ledger.parquet is
+    # flushed at clean-shutdown (which only happens at SIGINT or capture-period
+    # end). Without this card the dashboard showed `0` for ~48h capture uptime
+    # — a design bug observed 2026-07-25 after the Tailscale expose.
+    run_summary_path = STATE_DIR / "phase1a_run_summary.json"
+    try:
+        if run_summary_path.exists():
+            with open(run_summary_path) as f:
+                rs = json.load(f)
+            pe = rs.get("paper_executor") or {}
+            stats_rec = rs.get("stats_rec") or {}
+            out["in_memory_fills_count"] = int(pe.get("completed_fills_count", 0))
+            out["in_memory_placed_quotes_remaining"] = int(pe.get("placed_quotes_remaining", 0))
+            out["live_quote_submits_total"] = int(stats_rec.get("quote_submits_total", 0))
+            out["live_scan_count"] = int(stats_rec.get("scan_count", 0))
+            out["live_rotation_count"] = int(stats_rec.get("rotation_count", 0))
+            out["live_raw_msgs_total"] = int(stats_rec.get("raw_msgs_total", 0))
+            out["capture_runtime_sec"] = int(rs.get("captured_so_far_sec", 0))
+            out["capture_is_running"] = bool(rs.get("is_running", False))
+            out["capture_capture_sec"] = int(rs.get("capture_sec", 172800))
+        else:
+            out["in_memory_fills_count"] = 0
+    except Exception as e:
+        out["in_memory_fills_error"] = str(e)
+
+    # ledger.parquet — last 10 fills (gets written ONLY at clean shutdown)
     ledger_path = STATE_DIR / "ledger.parquet"
     try:
         if ledger_path.exists():
@@ -97,6 +123,12 @@ def gather_state() -> dict:
         else:
             out["fills_last_10"] = []
             out["fills_total"] = 0
+            out["ledger_not_yet_flushed"] = (
+                "ledger.parquet is written only at clean shutdown of main_paper.py "
+                "(main_paper.py:359 paper_executor.flush_fills_to_parquet). The "
+                "running live capture (PID 140060 etc) holds completed_fills in "
+                "memory only; raise in_memory_fills_count above for the live view."
+            )
     except Exception as e:
         out["ledger_error"] = str(e)
 
@@ -220,7 +252,11 @@ function renderCards(s) {
   cards.push({label: 'scans/count', value: stats_rec.scan_count ?? '0'});
   cards.push({label: 'rotations', value: stats_rec.rotation_count ?? '0'});
   cards.push({label: 'submits', value: stats_rec.quote_submits_total ?? '-'});
-  cards.push({label: 'fills', value: s.fills_total ?? '-'});
+  cards.push({label: 'fills (on disk)', value: s.fills_total ?? '-'});
+  cards.push({label: 'fills (in-memory)', value: s.in_memory_fills_count ?? '-'});
+  cards.push({label: 'live submits', value: s.live_quote_submits_total ?? '-'});
+  cards.push({label: 'live rotations', value: s.live_rotation_count ?? '-'});
+  cards.push({label: 'cap uptime', value: (s.capture_runtime_sec || 0) + 's'});
   const wsDetect = (s.latency && s.latency.ws_detect_ms) || {};
   const wsApply = (s.latency && s.latency.ws_apply_ms) || {};
   cards.push({label: 'ws_detect p50', value: wsDetect.p50 ?? '-'});

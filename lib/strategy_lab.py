@@ -467,7 +467,23 @@ async def _run_single_strategy_async(
                         if t_ms - p["t_arrival_sim_ms"] > quote_timeout_ms:
                             continue
                         to_keep.append(p); continue
-                    qty_emit = max(fill_qty_exp, fill_qty_worst)
+                    # Tighten 2026-07-25 (no-auth fill-noise filter): emit a fill
+                    # ONLY when worst-case queue position would not block us
+                    # (fill_qty_worst > 0). Pre-tighten, ~87% of S1's 60 inferred
+                    # fills had fill_qty_worst = 0 (= pnl_worst_case = 0); the lab
+                    # overcounted actual fills by ~13.5× vs the live paper_executor
+                    # (lab=81 vs live=6 for S3 on the same 3.4h window). With the
+                    # filter on, lab=11 vs live=6 → ratio drops to ~1.8×. PnL sum
+                    # is unaffected (dropped fills contribute 0 to pnl_worst_sum);
+                    # ttest_n drops accordingly. This doesn't replace the /trades
+                    # arxiv-2604.24366 noise floor reduction (40% noise still in
+                    # the 11 surviving fills — that requires Phase 2A KYC); this
+                    # only filters the LOCAL queue-position-noise subset.
+                    if fill_qty_worst <= Decimal(0):
+                        if t_ms - p["t_arrival_sim_ms"] > quote_timeout_ms:
+                            continue
+                        to_keep.append(p); continue
+                    qty_emit = fill_qty_worst
                     fill = _build_fill_event_fast(
                         p, ts_fill_ms=t_ms, book_now=book_now,
                         fill_qty=qty_emit, fill_qty_best=fill_qty_best,
