@@ -64,4 +64,45 @@ Interpretation:
 
 ## [2026-07-24 earlier — strategy doc v3] 
 
-See docs/polymarket_maker_strategy_v1.md §17 Phase 0 build + §18 activity-filtered scanner + 48h Phase 1A capture launched for the prior session's record.
+### Strategy Lab bug fixes — 2026-07-25 00:30 UTC (post cross-model GPT+Claude review)
+
+Cross-model review raised two answers I had to land before the 45h capture extension:
+
+1. **Claude priority-flag: "do the fill_id diff on s1 first"** (5-min-check against 45-hour commitment). DONE: byte-identical `ts_utc` and `asset_id` between the c14fe25 `ledger_s1.parquet` (41k-msg run) and the 329487c `ledger_s1.parquet` (170k-msg run). Root cause wasn't a stale-cache; the lab's `max_total_inventory_usd = 600` default saturates around fill #30 — after that, `quote_at_tick` returns `[]` for every subsequent router tick → no new placements → the 100 "fills" all came from the FIRST 3.27 min of capture regardless of subsequent 130k+ events.
+2. **GPT-designated primary research candidate: S3 (with capital-recycling merger).** First scan: capital-recycling was decorative — the strategy's `MergeStrategy.after_fill` post-incremented `self.realized_pnl_from_merges += ev.realized_pnl_usd` (a counter) but never informed `InventoryState` of the capital returned via merge → `total_inventory_usd` never decreased → S3 emitted the same number of fills as S2 (46 merges were observable but had NO effect on subsequent quote capacity).
+3. **Sign inversion in `InventoryState.apply_fill`** (`loops/router.py:56-61` — pre-fix code): when taker SOLD (we BOUGHT), the code subtracted from `per_market` → held shares became negative → strategy read `pos_yes = max(net_shares(yes), 0.0)` = 0 → `_maybe_exit` (Sell-side exit walker) returned None → held positions NEVER exited → `pnl_worst_case` was BID-touch edge alone, not round-trip realized PnL.
+4. **Naming-only cosmetic** (`lib/stat_selection.py:59 welch_t_test_one_sided_right`): is actually a one-sample t-test against zero (no second sample, no Welsh-Satterthwaite correction). p-value computed via the normal-CDF approximation for df≥30 — valid as the t → ∞ asymptote. Math OK for our $(n=60-81, t>4)$ regime; rename not done to keep scope tight.
+
+### Surgical fixes applied
+
+- `loops/router.py`: inverted `apply_fill` sign convention (we BOUGHT → per_market[+] case vs prior we BOUGHT → per_market[-]) so `_maybe_exit` actually emits SELL exits based on real held inventory → realized round-trip PnL is reachable. Added new `apply_merge_return(yes_id, no_id, qty, mid_yes, mid_no)` method that atomically decrements both `per_market[yes]` and `[no]` share counts + refreshes `per_market_usd` to reflect residual held shares.
+- `lib/strategy_lab.py`: after each `strategy.after_fill(fill, t_ms)` call, walks the decorator chain to find the deepest strategy carrying `.merge_events` (works for S3 + S4/S5/S6 because AntiThrash/ReversePosition/StopLoss all wrap an S3 base) — for each new MergeEvent, looks up `_pairs_by_condition[condition_id]` (reverse-index built once at init) + the YES/NO book current mids, then calls `inv.apply_merge_return(yes_token_id, no_token_id, ev.pair_qty, mid_y, mid_n)`. This is the wiring that makes the merger's capital recyclable; until this patch the merger was an accounting counter only.
+- `lib/strategy_lab.py`: reverted lab default `max_total_inventory_usd` from `600` → `200` and `max_inventory_per_market_usd` from `150` → `50` — now matches the live `config.yaml` budget. Lab and live paper_executor operate under the same capital constraints so the lab-to-live fill ratio (GPT spec) can be computed without an unaccounted cap differential confounding the gap.
+- All 6 test files (`tests/test_paper_executor.py`, `tests/test_poly_libs.py`, `tests/test_strategy_lab_smoke.py`, `tests/test_compounding_score.py`, `tests/test_stat_selection.py`, `tests/test_walk_forward.py`) pass through the refactored router + new merge wiring (no breakage from the sign flip because the tests don't assert on the bookkeeping sign — they assert on side_taker direction + the synthetic ledger row count).
+
+### Strategy Lab re-run verdict (post-fix, 263k-msg raw_events.jsonl)
+
+| # | strategy_id              | fills | qsub | merges | Σ pnl_worst | Welch n | Welch p    | gate       | side-taker distribution (BUY=we-sell / SELL=we-buy) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `s3_with_merge`         |  81 |  97 | 36 | +$3.2653 |  81 | 0.000662 | **PASS** | 11 / 70 (capital-recycled — incremental +26 fills above S2) |
+| 2 | `s1_poly_quoting`       |  60 |  70 |  0 | +$2.3303 |  60 | 0.003183 | **PASS** |  5 / 55 (no merger → cap-bounded at ~60 fills) |
+| 3 | `s2_reduce_only`        |  55 |  65 |  0 | +$2.3303 |  55 | 0.003078 | **PASS** |  5 / 50 (REDUCE_ONLY silences a few adds) |
+| 4 | `s4_anti_thrash`        |  45 |  53 |  0 | +$0.9356 |  45 | 0.052479 | FAIL (8 short of α) | 11 / 34 |
+| 5 | `s5_reverse_pos`        |  32 |  40 |  0 | +$0.9356 |  32 | 0.051156 | FAIL | (S4 base; same fill profile) |
+| 6 | `s6_stop_loss`          |  32 |  40 |  0 | +$0.9356 |  32 | 0.051156 | FAIL | (S4 base; no RV scenario in 1.6h capture to exercise stop) |
+| 7 | `s0_bb_tick`           |  32 | 246 |  0 |  $0.0000 |  32 | 1.0       | FAIL    | (queue_ahead_consume_all depth at worst-fill case) |
+
+### Critical takeaways (post-fix)
+
+- **The +$4.20 was inflated by the sign bug (~2×)**: post-fix pure-quoting S1 produces +$2.33 over 60 fills (vs the prior +$4.20 over 100 fills where 40 of the 100 came from never-tightening BUY-additions inventory-saturated at the lab's $600 cap).
+- **S3 separates cleanly from S2/S1 for the first time**: 81 fills vs S2's 55 (= +26 incremental fills = +47% over S2) and +$0.94 PnL lift ($3.27 vs $2.33) driven exclusively by the merger recycling mechanism. The pre-fix table had S3 == S2 with the merge-recycle claimed but never wired through to the InventoryState; now the recycling IS visible in fill count and PnL.
+- **Sell-side exits now fire** (the sign-flip's direct effect on `_maybe_exit`): S3 has 11 BUY-side (we-SELL our held YES) fills vs 70 SELL-side (we-BUY); S1 has 5 / 55. Pre-fix was 0 / N for all strategies (~(100, 100, 92, ...) ALL SELL-side). This is the proof-of-life for round-trip PnL measurement.
+- **Fills still concentrated in the first 3.27 min** (max `ts_utc` of fill = 1784927186261, the 196s mark)— despite the larger $50/$200 capital budget matching config.yaml, the WS rotation to NEW asset_ids ~3.5 min into the capture introduces markets where the lab's book_state for those `asset_id`s starts cold (no observed `book` snapshot yet for the new rotation set). For the upcoming full 48h capture's lab rerun, each new rotation cycle in raw_events.jsonl will see this same cold-start; we'll only fully exercise the strategy if multiple complete router-rotation cycles elapse per scan. **Coverage gap named for Phase 1B**: extending `--router-tick-sec` (currently 5s) downstream of WS rotation + seeding the strategy's book_state at the moment of rotation with `/book` REST prefetch should close the cold-start gap; OR rotate strategy.date-of-birth alongside the labSeen-assets roll.
+
+### Naming / doc debt remaining
+
+- `lib/stat_selection.py::welch_t_test_one_sided_right`: rename to `one_sample_t_test_right_tail` (cosmetic, low priority — math is correct; the "Welch" misnomer was Claude's flag; don't extend this surgery now since prior `p < 0.05` gate decisions are unaffected).
+- Strategy doc §19 addendum for the post-fix re-verdict table — TO file.
+- Coverage-gap note for `S4-S6`'s marginal FAIL (Welch p=0.051-0.052 just barely above α=0.05): the cumulative-decorator chain (AntiThrash → ReversePosition → StopLoss) propagates the S4 base's behavior through; S5/S6 don't independently exercise their decorator logic in the 1.6h esports-heavy / no-RV-drawdown sample. THIS IS A COVERAGE GAP named for Phase 1B not a code bug.
+
+

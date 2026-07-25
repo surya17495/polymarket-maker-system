@@ -348,6 +348,11 @@ async def _run_single_strategy_async(
     )
     inv = router.inventory
 
+    # Reverse index: condition_id -> MarketPair  (for apply_merge_return wiring)
+    _pairs_by_condition: dict[str, object] = {}
+    for _p in pair_map.values():
+        _pairs_by_condition[_p.condition_id] = _p
+
     # 3) placements indexed by asset_id
     placements_by_asset: dict[str, list[dict]] = defaultdict(list)
     completed_fills: list[dict] = []
@@ -477,6 +482,42 @@ async def _run_single_strategy_async(
                             strategy.after_fill(fill, t_ms)
                     except Exception:
                         pass
+
+                    # Wire MergeEvents back into InventoryState (capital recycling).
+                    # Bug-fix 2026-07-25: previously the strategy's `MergeStrategy.after_fill`
+                    # added `realized_pnl_from_merges += ev.realized_pnl_usd` (a counter only);
+                    # the InventoryState never decreased, so `total_inventory_usd` didn't
+                    # actually cycle — S3 had the same fill count as S2 (46 merges were
+                    # decorative).  Now: for each NEW merge event emitted by the strategy
+                    # this tick, decrement `per_market[yes]` and `[no]` by `pair_qty` so
+                    # the cap releases and new BID orders can fire post-merge.
+                    #
+                    # Walk the decorator chain to find the inner-most strategy carrying
+                    # `merge_events` (= MergeStrategy or one of its decorator wrappers
+                    # AntiThrash/ReversePosition/StopLoss).  S1/S2 have no MergeStrategy
+                    # anywhere in the chain → `_merge_source` stays None and we skip.
+                    _merge_source = strategy
+                    while _merge_source is not None and not hasattr(_merge_source, "merge_events"):
+                        _merge_source = getattr(_merge_source, "base", None)
+                    if _merge_source is not None and _merge_source.merge_events:
+                        prev_n = getattr(_merge_source, "_lab_merge_events_consumed", 0)
+                        for ev in _merge_source.merge_events[prev_n:]:
+                            pair = _pairs_by_condition.get(ev.condition_id)
+                            if pair is None:
+                                continue
+                            yes_b = book_store_inner.books.get(pair.yes_token_id)
+                            no_b = book_store_inner.books.get(pair.no_token_id)
+                            mid_y = float((yes_b.best_bid() + yes_b.best_ask()) / 2) \
+                                if yes_b and yes_b.best_bid() is not None and yes_b.best_ask() is not None \
+                                else 0.0
+                            mid_n = float((no_b.best_bid() + no_b.best_ask()) / 2) \
+                                if no_b and no_b.best_bid() is not None and no_b.best_ask() is not None \
+                                else 0.0
+                            inv.apply_merge_return(
+                                pair.yes_token_id, pair.no_token_id,
+                                ev.pair_qty, mid_yes=mid_y, mid_no=mid_n,
+                            )
+                        _merge_source._lab_merge_events_consumed = len(_merge_source.merge_events)
                     # Done with this placement — DON'T append to to_keep
                 placements_by_asset[aid] = to_keep
 
@@ -663,14 +704,14 @@ def run_strategy_lab(
                 trimmed[p.no_token_id] = p
             pair_map = trimmed
 
-    cfg_router = RouterConfig(
-        quote_size_usd=quote_size_usd if quote_size_usd else 50.0,
-        max_inventory_per_market_usd=(
-            max_inventory_per_market_usd if max_inventory_per_market_usd else 150.0
-        ),
-        max_total_inventory_usd=(
-            max_total_inventory_usd if max_total_inventory_usd else 600.0
-        ),
+        cfg_router = RouterConfig(
+            quote_size_usd=quote_size_usd if quote_size_usd else 50.0,
+            max_inventory_per_market_usd=(
+                max_inventory_per_market_usd if max_inventory_per_market_usd else 50.0
+            ),
+            max_total_inventory_usd=(
+                max_total_inventory_usd if max_total_inventory_usd else 200.0
+            ),
         max_quote_lag_ms=300000,
         router_tick_sec=router_tick_sec,
     )

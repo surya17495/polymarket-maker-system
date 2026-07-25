@@ -54,11 +54,33 @@ class InventoryState:
         return sum(self.per_market_usd.values())
 
     def apply_fill(self, asset_id: str, fill_qty: float, side_taker: str, mid: float) -> None:
+        # side_taker is the TAKER side.  When taker SOLD they hit our BID → we
+        # ACQUIRED shares → our position INCREASES.  When taker BOUGHT they
+        # lifted our ASK → we SOLD → our position DECREASES.  The previous
+        # convention was inverted (subtracted on SELL), which made
+        # `pos_yes = max(net_shares(yes), 0.0)` always return 0 → the
+        # strategy never emitted SELL exits via `_maybe_exit`.  Fixed
+        # 2026-07-25 after cross-model (GPT+Claude) review surfaced the
+        # byte-identical fill timestamps bug.
         if side_taker == "SELL":
-            self.per_market[asset_id] = self.per_market.get(asset_id, 0.0) - fill_qty
-        else:
             self.per_market[asset_id] = self.per_market.get(asset_id, 0.0) + fill_qty
+        else:
+            self.per_market[asset_id] = self.per_market.get(asset_id, 0.0) - fill_qty
         self.per_market_usd[asset_id] = abs(self.per_market[asset_id]) * mid
+
+    def apply_merge_return(self, yes_id: str, no_id: str, qty: float,
+                           mid_yes: float = 1.0, mid_no: float = 0.0) -> None:
+        """Apply a YES+NO atomic pair-merge: removes `qty` YES and `qty` NO shares
+        from held inventory (the pair-typed shares are returned to Polymarket
+        for $1 USDC each pair via the ConditionalTokens / NegRiskAdapter contracts).
+        Updates per_market_usd entries to reflect the RESIDUAL held-quantity
+        post-merge. This is what unlocks the `total_inventory_usd` cap so new
+        BID-side adders can fire after the merge.
+        """
+        self.per_market[yes_id] = self.per_market.get(yes_id, 0.0) - qty
+        self.per_market[no_id] = self.per_market.get(no_id, 0.0) - qty
+        self.per_market_usd[yes_id] = abs(self.per_market.get(yes_id, 0.0)) * mid_yes
+        self.per_market_usd[no_id] = abs(self.per_market.get(no_id, 0.0)) * mid_no
 
 
 @dataclass
