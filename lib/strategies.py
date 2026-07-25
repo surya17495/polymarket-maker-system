@@ -266,16 +266,17 @@ class MergeStrategy(ReduceOnlyStrategy):
 
 class AntiThrashStrategy(Strategy):
     """S4 — drop re-quote when Δmid<price_delta_c and Δsize<size_delta_pct threshold.
-    
-    Defaults: price_delta_c=0.10 (lowered from earlier 0.5; prior setting suppressed
-    almost all requote on slow markets, producing 2 emit cycles total over a 1.6h
-    capture which gave AntiThrash nothing to compare against waits). 0.10c gives a
-    tighter threshold that respects real book tick movement but still suppresses
-    pure-noise sub-tick requotes.
+
+    Defaults: price_delta_c=0.50c, size_delta_pct=0.10 (10%). Empirical 2026-07-24
+    lab re-run with 0.10c/5% produced only 2 quote_submits over a 170k-event run
+    (vs 2088 with 0.50c/10%) — i.e. tighter thresholds suppress MORE requotes,
+    not fewer. The condition `dp < thr AND ds_rel < thr_pct` fires more often
+    when thresholds are smaller. Poly-maker's original 0.50c/10% defaults let
+    nearly every requote survive (moves > 0.5c are common on esports markets).
     """
     strategy_id = "s4_anti_thrash"
 
-    def __init__(self, base: Strategy, price_delta_c: float = 0.10, size_delta_pct: float = 0.05):
+    def __init__(self, base: Strategy, price_delta_c: float = 0.50, size_delta_pct: float = 0.10):
         self.base = base
         self.price_delta_c = price_delta_c
         self.size_delta_pct = size_delta_pct

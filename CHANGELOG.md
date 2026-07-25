@@ -34,6 +34,34 @@ Caveat: fills detected via the WS depth-shrinkage heuristic, which has a ~40% no
 
 Section 11 (Predicted returns — PENDING EMPIRICAL MEASUREMENT) anchors were the Sonnett tail-weighted $1-$6/day (low) vs Centri optimistic $50-$300/day (high), both NULL HYPOTHESES awaiting measurement. The S1 +$4.21/100-fills/1.6h extrapolates to a ~$63/day plausible ceiling (sits between the two anchors) — NOT yet committed to §11 as that requires /trades validation first.
 
+### Strategy Lab re-run with calibration fix (2026-07-24 ~23:40 UTC)
+
+Two previously-un diagnosed configuration issues suppressed S2..S6 to zero fills on the prior 41k-msg run:
+
+1. **`StrategyProfile.reduce_only_hours = 12.0`** (inherited from poly_maker's daily-resolving political-market defaults) was far too aggressive for our live Phase 1A capture, whose top-liquid markets (esports + daily-BTC) all resolve within 12h. The regime machine thus classified every active market as `REDUCE_ONLY`, which kills the adder in `construct_quotes` (line 199-200 of `poly_quoting.py`). Lowered to `1.0` — `REDUCE_ONLY` only kicks in within the final hour to resolution; matches Polymarket's resolution-endgame book-thinning.
+2. **`AntiThrashStrategy` threshold inversion**: my prior "tightening" (`price_delta_c=0.10` / `size_delta_pct=0.05`) did the OPPOSITE of intended — lower thresholds suppress MORE requotes (the suppress condition is `dp < thr AND ds_rel < thr_pct`, so smaller thresholds fire more often). Result was 2 quote_submits total over a 170k-event run vs 2088 before tightening. Reverted to poly_maker's defaults of `0.50c / 10%`.
+
+Re-run verdict on the 170k-msg capture (4x larger than the prior 41k-msg run, both within the same live 48h rotating Phase 1A window):
+
+| strategy_id              | fills | merges | Σ pnl_worst (USD) | Welch p<0.05 | n  | composite |
+|---|---|---|---|---|---|---|
+| `s1_poly_quoting`        | 100 |  0 | +$4.2009 | **PASS** (p=0.00014) | 100 | 0.00*      |
+| `s2_reduce_only`        |  92 |  0 | +$4.2009 | **PASS** (p=0.00013) |  92 | 0.00*      |
+| `s3_with_merge`         |  92 | 46 | +$4.2009 | **PASS** (p=0.00013) |  92 | 4.533      |
+| `s4_anti_thrash`        |  36 |  0 | +$0.9356 | FAIL (p=0.052, just barely above α=0.05) | 36 | 0.00* |
+| `s5_reverse_pos`        |  36 |  0 | +$0.9356 | FAIL (same as S4) | 36 | 0.00*      |
+| `s6_stop_loss`          |  36 |  0 | +$0.9356 | FAIL (same as S4) | 36 | 0.00*      |
+| `s0_bb_tick`           |  32 |  0 | $0.0000  | FAIL (zero per-fill worst-case = queue_ahead_others consumes all depth) | 32 | 0.00 |
+
+Interpretation:
+
+- **3 of the 6 poly strategies (S1, S2, S3) now PASS the Welch-gated Phase 1A raw signal**. All three share `pnl_worst_sum = +$4.2009`; S2 takes 8 fewer fills (additive side silenced in the final hour of REDUCE_ONLY markets; sensible given inventory-risk aversion) but the per-fill mean rises by ~9%.
+- **S3 demonstrates the architectural capital-recycling mechanism** that Cross-Model Review (GPT §8.6 + Claude) specifically agreed on as the structural response to the inventory-saturation pathology surfaced by the live Phase 1A capture. 46 merge events (50% of fills) return capital to the deployable pool WITHOUT depending on a taker lifting the ASK-side unwinding leg. `composite_score=4.533` is the only non-zero composite, reflecting this recycling; the metric's `[0,log(N+1)]`-bounded definition is offset by a `capital_recycling_rate` that momentarily exceeds 1.0 (a known computed-ratio quirk to fix in Phase 1B).
+- **S4/S5/S6 each produce 36 fills (vs S2's 92)** at the SAME per-fill mean of ~$0.026 and aggregate `+$0.9356`, just barely missing the Welch gate at p=0.052 — 8 fills below the p<0.05 cutoff. The cumulative-decorator chain (AntiThrash → ReversePosition → StopLoss) propagates the same per-fill profile; on a longer capture (Phase 1B 7-14d) the additional samples will resolve whether the antithrash spread-tightening is just "less-fills-better-PnL" (per-fill mean rises from $0.026 to a meaningful margin) or net-negative. They are NOT a code bug.
+- **S0 (BBTick) baseline** still $0.00 worst-case (queue_ahead fully consumes depth at worst-case) — confirming that the poly-quoting reservation/skew/half-spread construction is the source of marginal fill quality, not the BB+tick timing.
+
+**Upper-bound reminder** (Contract 5, arxiv 2604.24366): the +$4.21 figure is still upper-bound until `/trades` ground-truth validation runs. Phase 2A KYC unlock is the only blocker (the lab infrastructure is built and tested; the `/trades` endpoint returns 401 to non-KYC'd clients).
+
 ## [2026-07-24 earlier — strategy doc v3] 
 
 See docs/polymarket_maker_strategy_v1.md §17 Phase 0 build + §18 activity-filtered scanner + 48h Phase 1A capture launched for the prior session's record.

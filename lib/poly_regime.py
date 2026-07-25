@@ -38,7 +38,7 @@ class Regime(Enum):
 @dataclass(slots=True)
 class StrategyProfile:
     halt_before_hours: float = 0.25  # was 1.0 -> too aggressive; kills esports markets whose endDate is within 1h of capture moment, blocking all quotes. Tighten to 15-minutes-of-resolution stop-work.
-    reduce_only_hours: float = 12.0
+    reduce_only_hours: float = 1.0   # was 12.0 -> empirical 2026-07-24 lab re-run showed S2-S6 produced ZERO fills because every active market (esports/daily-BTC) resolves within 12h, so reduce_only_hours=12.0 forced REDUCE_ONLY across the board and killed the adder. 1h matches polymarket's resolution-endgame practice (top-of-book thins in the final hour).
     event_jump_ticks: int = 30      # FV jump > 30 ticks = event
     event_cooloff_s: float = 30.0
     trend_flow_z: float = 0.6       # |flow_z| ≥ 0.6 = trending
