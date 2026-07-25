@@ -117,9 +117,23 @@ def _validate_fills_via_trades_truth(
                 trades = []
         if not trades:
             try:
+                # 2026-07-25: per-cid time-window for data-api /trades (no-auth
+                # endpoint). For a condition_id's lab fill ts_utc_ms spread, we
+                # query the trade record within ±300s of [ts_min, ts_max] — the
+                # buffer covers data-api's on-chain tx propagation delay (~5-30s)
+                # vs the lab's WS-event-time inferred fill ts.
+                cid_ts_list = [int(f.get("ts_utc") or 0) for f in fills
+                               if f.get("market") == cid and f.get("ts_utc")]
+                if cid_ts_list:
+                    cid_min_ts_ms = max(0, min(cid_ts_list) - 300_000)
+                    cid_max_ts_ms = max(cid_ts_list) + 300_000
+                else:
+                    cid_min_ts_ms = None
+                    cid_max_ts_ms = None
                 trades = fetch_all_trades(
                     market_condition_id=cid, asset_id=None,
                     taker_only=True, max_pages=max_pages_per_condition,
+                    min_ts_ms=cid_min_ts_ms, max_ts_ms=cid_max_ts_ms,
                 )
                 if cached_path is not None and trades:
                     try:

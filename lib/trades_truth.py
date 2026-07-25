@@ -24,9 +24,28 @@ import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
-DEFAULT_CLOB = "https://clob.polymarket.com"
+# 2026-07-25 (post-user-question "does relayer key do the job on /trades?"):
+# Polymarket's CLOB team gated `clob.polymarket.com/trades` behind EIP-712 / L2
+# auth — /trades 401's without an HMAC-signed credential (L2 personal API key
+# OR an approved relayer key would both work; user asked, I empirically tested).
+# The DATA-API service at `data-api.polymarket.com` — separate infra, run by
+# Polymarket's analytics team for the user-to-browser dashboard — serves the
+# same trade records WITHOUT auth (verified HTTP 200 with `market=<condId>` +
+# `limit=N` + `minTimestamp`/`maxTimestamp` Unix-seconds filters).  We're now
+# wiring the lab's `_validate_fills_via_trades_truth` path to that endpoint so
+# the `+$3.27` lab figures can finally become validated economic PnL rather
+# than upper-bound raw signal. Schema differences from CLOB /trades:
+#   - `asset` field (was `asset_id`) — renamed in the new endpoint
+#   - `timestamp` in Unix SECONDS (CLOB /trades was MS) — we convert on ingress
+#   - `takerOnly` flag absent — we treat all entries as maker+taker; the lab's
+#     cross-match logic validates by `asset_id + side + ts_window`, which is
+#     unaffected by the missing takerOnly flag
+#   - `transactionHash` available — used as canonical trade_id
+#   - `proxyWallet`/`name`/`pseudonym`/`profileImage`/`eventSlug`/`title`/
+#     `icon`/`outcome`/`outcomeIndex`/`slug` populated for the UX dashboard
+DEFAULT_CLOB = "https://data-api.polymarket.com"
 DEFAULT_TIMEOUT = 8.0
-USER_AGENT = "polymarket-lab/0.1 (+local)"
+USER_AGENT = "polymarket-lab/0.1 (+local; unwalled data-api truth)"
 
 
 @dataclass
@@ -37,7 +56,7 @@ class TradeRecord:
     price: float
     ts: int                # ms
     trade_id: str | None = None
-    takerOnly: bool = True
+    taker_only: bool = True
     fee_rate_bps: float = 0.0
 
 
@@ -48,19 +67,28 @@ def _fetch_trades(
     limit: int = 500,
     offset: int = 0,
     timeout: float = DEFAULT_TIMEOUT,
+    min_ts_sec: int | None = None,
+    max_ts_sec: int | None = None,
 ) -> list[dict]:
-    """Paginated /trades fetch.
+    """Fetch a single page from data-api.polymarket.com/trades.
 
-    Per brief: /trades ignores asset_id filter when no market filter is given;
-    so we filter by market_condition_id first (when known), then post-filter by asset_id.
+    data-api supports:  market=<conditionId>  limit=N  offset=N
+    minTimestamp=<unixSec>  maxTimestamp=<unixSec>
+
+    `taker_only` is kept for backward-compat with the old CLOB signature but
+    is a no-op on data-api (the endpoint doesn't expose a takerOnly filter);
+    we treat all returned trades as maker+taker and let the lab's cross-match
+    logic discriminate by `side`/`asset_id`/`ts` post-fetch.
     """
     params = {"limit": limit, "offset": offset}
     if market_condition_id:
         params["market"] = market_condition_id
     if asset_id:
-        params["asset_id"] = asset_id
-    if taker_only:
-        params["takerOnly"] = "true"
+        params["asset"] = asset_id
+    if min_ts_sec is not None:
+        params["minTimestamp"] = int(min_ts_sec)
+    if max_ts_sec is not None:
+        params["maxTimestamp"] = int(max_ts_sec)
     qs = urllib.parse.urlencode(params)
     url = f"{DEFAULT_CLOB}/trades?{qs}"
     req = urllib.request.Request(
@@ -81,10 +109,24 @@ def fetch_all_trades(
     taker_only: bool = True,
     max_pages: int = 30,
     page_size: int = 500,
+    min_ts_ms: int | None = None,
+    max_ts_ms: int | None = None,
 ) -> list[TradeRecord]:
-    """Fetch trades for one market_condition_id, paginate, post-filter by asset_id."""
+    """Fetch trades for one market_condition_id, paginate, post-filter by asset_id.
+
+    2026-07-25: backend switched from clob.polymarket.com/trades (401 without
+    L2 auth) to data-api.polymarket.com/trades (no auth needed). When
+    min_ts_ms/max_ts_ms are given, we additionally convert to Unix seconds and
+    send as minTimestamp/maxTimestamp — the data-api supports this filter
+    directly, avoiding the deep-trades-pagination problem (for high-volume
+    markets like BTC daily where 30 pages × 500 = 15k trades can be wall
+    depth < 1h; with a time-window filter we get the lab-fill-spanning window
+    in a single page).
+    """
     out: list[TradeRecord] = []
     seen_ids: set[str] = set()
+    min_ts_sec = int(min_ts_ms / 1000.0) if min_ts_ms is not None else None
+    max_ts_sec = int(max_ts_ms / 1000.0) if max_ts_ms is not None else None
     for page in range(max_pages):
         offset = page * page_size
         batch = _fetch_trades(
@@ -93,30 +135,49 @@ def fetch_all_trades(
             taker_only=taker_only,
             limit=page_size,
             offset=offset,
+            min_ts_sec=min_ts_sec,
+            max_ts_sec=max_ts_sec,
         )
         if not batch:
             break
         for t in batch:
-            tid = t.get("id") or t.get("trade_id") or f"{t.get('asset_id', '')}-{t.get('timestamp', '')}-{t.get('price', '')}"
+            # data-api schema: `asset` (was `asset_id`), `transactionHash`
+            # available as canonical id, `timestamp` in Unix SECONDS (convert
+            # to MS to match the lab's fill ts_utc_ms field). CLOB /trades had
+            # `id`/`tradeId`/`asset_id`/`takerOnly` — fall through to those
+            # aliases for backward-compat with a clob.polymarket.com fetch.
+            tid = (
+                t.get("transactionHash")
+                or t.get("id") or t.get("trade_id")
+                or f"{t.get('asset', t.get('asset_id', ''))}-{t.get('timestamp', '')}-{t.get('price', '')}"
+            )
             if tid in seen_ids:
                 continue
             seen_ids.add(tid)
-            tr_asset_id = t.get("asset_id") or ""
+            tr_asset_id = t.get("asset") or t.get("asset_id") or ""
             if asset_id and tr_asset_id != asset_id:
                 continue
+            # data-api /trades uses Unix seconds; CLOB /trades used ms. Auto-detect:
+            # if the timestamp is < 1e12 it's clearly seconds (1.78 × 10^9 ≈ now).
+            raw_ts = t.get("timestamp") or t.get("ts") or 0
+            try:
+                ts_raw_num = int(raw_ts)
+            except (TypeError, ValueError):
+                ts_raw_num = 0
+            ts_ms = ts_raw_num if ts_raw_num > 10**12 else ts_raw_num * 1000
             try:
                 rec = TradeRecord(
                     asset_id=tr_asset_id,
                     side=t.get("side") or "BUY",
                     size=float(t.get("size") or 0.0),
                     price=float(t.get("price") or 0.0),
-                    ts=int(t.get("timestamp") or t.get("ts") or 0),
+                    ts=ts_ms,
                     trade_id=str(tid),
                     taker_only=bool(t.get("takerOnly", True)),
                     fee_rate_bps=float(t.get("feeRateBps") or 0.0),
                 )
                 out.append(rec)
-            except Exception as e:
+            except Exception:
                 continue
         if len(batch) < page_size:
             break
