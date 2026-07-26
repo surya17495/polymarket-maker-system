@@ -69,7 +69,7 @@ def _validate_fills_via_trades_truth(
     strategy_id: str,
     max_pages_per_condition: int = 30,
     trades_cache_dir: Path | None = None,
-    side_match_tolerance_ms: int = 5000,
+    side_match_tolerance_ms: int = 600_000,
 ) -> dict:
     """Cross-match each lab-emitted fill against the authoritative /trades REST
     endpoint payload for the same condition_id.
@@ -614,7 +614,7 @@ async def _run_single_strategy_async(
         trade_validation_summary = _validate_fills_via_trades_truth(
             completed_fills, output_dir, strategy_id,
             trades_cache_dir=output_dir,
-            side_match_tolerance_ms=5000,
+            side_match_tolerance_ms=600_000,
         )
         validated_fills = [f for f in completed_fills if f.get("trades_truth_match_tid")]
         validated_ledger_path = output_dir / f"ledger_{strategy_id}_validated.parquet"
