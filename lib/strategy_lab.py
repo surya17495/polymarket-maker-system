@@ -156,7 +156,26 @@ def _validate_fills_via_trades_truth(
         fetched_summary[cid[:10]] = len(trades)
     log.info("[%s] trades fetch complete; total cached entries=%d",
              strategy_id, sum(fetched_summary.values()))
+    # 2026-07-26 (Track B): aggregate truth-validated pnl across only the
+    # fills that passed the /trades cross-match. The lab_v5-numbered
+    # `pnl_worst_sum` field in lab_ranking.json is the HEURISTIC
+    # depth-shrinkage-inflated phantom PnL (per empirical debug:
+    # 0/19 fills for s4_anti_thrash passed cross-match vs data-api truth —
+    # the lab's heuristic renders maker-cancel-driven depth shrinks as
+    # phantom taker-cross fill events). Until Phase-2A live KYC is wired,
+    # the EMPIRICAL truth-validated PnL is the only honest $/day indicator
+    # we can quote. We emit three truth-validated sums here so that the
+    # lab_ranking.json output table can carry both:
+    #   - heuristic_pnl_worst_sum (the inflated upper bound)
+    #   - truth_validated_pnl_worst_sum (the /anchored floor)
+    # When truth_validated_pnl_worst_sum == 0 for all strategies (an
+    # empirical state for the lab_v5 sample on 22.3h capture), the lab is
+    # truth-anchored to $0/day across all strategies, regardless of what
+    # the heuristic phantom PnL reports.
     matched = 0
+    truth_pnl_worst_sum = 0.0
+    truth_pnl_expected_sum = 0.0
+    truth_pnl_best_sum = 0.0
     for f in fills:
         cid = f.get("market")
         ts_fill = int(f.get("ts_utc") or 0)
@@ -173,6 +192,23 @@ def _validate_fills_via_trades_truth(
         if cands:
             f["trades_truth_match_tid"] = cands[0].trade_id or ""
             matched += 1
+            # Aggregate truth-validated PnL sums (mirrors the heuristic
+            # fields populated in _build_fill_event_fast — pnl_worst_case /
+            # pnl_expected_case / pnl_best_case).  When the heuristics
+            # model is wrong (phantom), these stay 0; when it's right and
+            # /trades validates, they sum to the truth-anchored PnL.
+            try:
+                truth_pnl_worst_sum += float(f.get("pnl_worst_case") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                truth_pnl_expected_sum += float(f.get("pnl_expected_case") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                truth_pnl_best_sum += float(f.get("pnl_best_case") or 0.0)
+            except (TypeError, ValueError):
+                pass
         else:
             f["trades_truth_match_tid"] = ""
     return {
@@ -180,6 +216,12 @@ def _validate_fills_via_trades_truth(
         "total_fills": len(fills),
         "trades_truth_match_rate": matched / max(len(fills), 1),
         "trades_truth_per_condition": fetched_summary,
+        # Truth-anchored PnL floor (0.0 when no validations pass, as in
+        # lab_v5 run — confirm by inspecting lab_ranking.json
+        # ranking[i].truth_validated_pnl_worst_sum for any sid).
+        "truth_validated_pnl_worst_sum": round(truth_pnl_worst_sum, 6),
+        "truth_validated_pnl_expected_sum": round(truth_pnl_expected_sum, 6),
+        "truth_validated_pnl_best_sum": round(truth_pnl_best_sum, 6),
     }
 
 
@@ -665,6 +707,19 @@ async def _run_single_strategy_async(
         "trades_truth_match_rate": trade_validation_summary["trades_truth_match_rate"],
         "trades_truth_per_condition": trade_validation_summary["trades_truth_per_condition"],
         "ledger_validated_path": str(validated_ledger_path) if validated_ledger_path and validated_ledger_path.exists() else "",
+        # 2026-07-26 (Track B) — truth-anchored PnL floors (lab_v5 versus
+        # data-api cross-match found 100% phantom heuristic fills; these
+        # fields expose the /anchored truth — 0.0 in lab_v5 for every
+        # strategy). Until Phase-2A KYC, these are the empirical $/day
+        # floors; the heuristic `pnl_worst_sum` etc. above remain upper
+        # bounds inflated by the lab's phantom fill rate (~100% phantom
+        # in lab_v5's 22.3h capture window).
+        "truth_validated_pnl_worst_sum": trade_validation_summary.get(
+            "truth_validated_pnl_worst_sum", 0.0),
+        "truth_validated_pnl_expected_sum": trade_validation_summary.get(
+            "truth_validated_pnl_expected_sum", 0.0),
+        "truth_validated_pnl_best_sum": trade_validation_summary.get(
+            "truth_validated_pnl_best_sum", 0.0),
         "metrics_via_trades_truth": metrics_validated,
         "ttest_via_trades_truth": {
             "n": ttest_validated.n, "mean": ttest_validated.mean, "std": ttest_validated.std,

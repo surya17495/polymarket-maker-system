@@ -19,6 +19,7 @@ __pycache__/
 # --- secrets / env files ---
 .env
 .env.*
+!.env.example
 secrets/
 *.pem
 *.json_key

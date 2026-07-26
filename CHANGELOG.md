@@ -2,6 +2,44 @@
 
 All notable changes are documented here. Format follows Keep a Changelog; session-bucketed because the project's development happens in conversational sessions, not commits.
 
+## WIP — 2026-07-26 session: empirical truth-anchoring + Phase-2A scaffolding
+
+### Empirical Findings (CRITICAL)
+- **The lab heuristic is empirically 100% phantom.** A direct live probe of `data-api.polymarket.com/trades` against the lab_v5 `ledger_s4_anti_thrash.parquet` (19 fills / 10 condition_ids / 13-min capture window 2026-07-24 21:03–21:17 UTC) returned **0/19 cross-match against /trades truth** — and this is NOT a cross-match bug. Verified by direct curl + manual data-api response inspection: the lab's depth-shrinkage fill heuristic (`lib/strategy_lab.py`:440–514) interprets EVERY depth shrink at our queue position as a taker-cross fill event; in reality **maker-order cancelations** cause depth shrinks that look identical to taker-trades. Per-condition inspection:
+  - 13/19 fills: data-api returned **ZERO same-side same-asset trades** in the entire ±60-min window around the lab's inferred `ts_utc` (i.e., no real taker sold into our bid at all — the depth "shrink" was a maker cancel).
+  - 6/19 fills: same-side same-asset trades existed but all were 27+ min away from the lab's inferred `ts_utc` (closest: -1638 sec — well beyond the ±600 sec cross-match tolerance).
+  - All 18 side_taker="SELL" lab fills had OPPOSITE-side (BUY) data-api trades within ±600s, but those are ASK-lifts that did not cross our BID price (q.price < data-api's trade price).
+- **Pre-KYC empirical truth-baseline `/day` = $0** for the S4-anti-thrash strategy on $50/$200 cap over the lab_v5 capture window. The lab_v3 numbers ($0.20–$17.74/day, Welch p=0.021 PASS on the 19 phantom fills) are NOT truth-anchored; the Welch p=0.021 spurious-pass happened on noise-inflated phantom fills (n=19 phantom-inflated).
+- **Correlation truth vs specific truth** (acknowledged from the arxiv 2604.24366 ground): even a same-side data-api cross-match NEAR our ts is a CORRELATION truth only (a same-side trade near our ts doesn't prove OUR quote took the maker slot, could be another MM). The only fully-truthful validation is **Phase-2A live KYC + L2 EIP-712 wallet-signed order** with the **on-chain fillReceipt** attribute tied to our proxyWallet.
+- **Empirically validates the user's `pre-deployment-validation-preference` mandate** ("I want an estimated range before real capital"): the cross-model pre-data $0.10–$15/day range was 30✗ optimistic PRE-data-anchoring. Data-anchored pre-KYC = $0. The mandate to refuse $/day estimates without empirical grounding has now proven to be the right policy.
+
+### Added (Phase-2A scaffolding — KYC-paused, deployable on KYC-clear)
+- **`lib/live_order_placer.py`** — Phase-2A `LiveOrderPlacer` class with `LiveOrderCredentials.from_env()` (POLY_L2_API_KEY, POLY_L2_API_SECRET, POLY_L2_API_PASSPHRASE, POLY_EVM_WALLET_PRIV_KEY, optional POLY_PROXY_WALLET_ADDRESS) loader. Module imports cleanly without `py_clob_client` installed (lazy import). Constructor raises `LiveConfigurationError` when env creds incomplete; `place_quote` / `cancel_quote` / `poll_for_fills` methods raise `LiveNotImplementedError` pre-KYC with the documented post-KYC `py_clob_client.ClobClient` call-graph inline. `FillReceipt` dataclass with `transaction_hash` (canonical on-chain truth anchor) and `proxy_wallet_address` (custody-filter anchor) — replaces `/trades` data-api cross-match correlation truth with the **specific truth** of on-chain fillReceipt-attribute-to-our-wallet.
+- **`main_live.py`** — Phase-2A entry script. CLI surfaces `--phase-2a N` `--top-n N` `--dry-run` `--no-rotation`. Construction preconditions gate on `.env` being populated (Polymarket KYC + L2 API key) AND `pip install py_clob_client` AND funded EVM wallet (separate from main_paper.py heuristic path; main_paper.py live paper executor stays untouched for regression baseline).
+- **`.env.example`** — template env file for the five POLY_* credential keys + optional proxy-wallet address; documents the signature_type=2 / funder=proxy_wallet Polymarket POLY_PROXY flow on Polygon zkEVM mainnet.
+- **`tests/test_live_order_placer.py`** — 8 tests covering: pre-KYC import without `py_clob_client` installed; `LiveOrderCredentials.from_env()` returns None for missing creds; LiveConfigurationError on incomplete creds; LiveNotImplementedError on `place_quote`; LiveConfigurationError on `connect()`; `main_live.py --help` exits 0; `main_live.py` without args exits 2. All 8 PASS.
+
+### Changed (lab heuristic truth-anchor wiring — Track B)
+- **`lib/strategy_lab.py::_validate_fills_via_trades_truth`** now aggregates and returns `truth_validated_pnl_worst_sum`, `truth_validated_pnl_expected_sum`, `truth_validated_pnl_best_sum` across the cross-match-validated fills only. Caller (`run_strategy_lab`) writes these three new fields into the lab_ranking.json per-strategy entry — the empirical truth anchored floor (0.0 when no validations pass, as in lab_v5 for every strategy).
+- **`lib/strategy_lab.py::run_strategy_lab` ranking output dict** now exposes three additional fields per-strategy entry: `"truth_validated_pnl_worst_sum"` `"truth_validated_pnl_expected_sum"` `"truth_validated_pnl_best_sum"` — surfaces the truth-anchored PnL alongside the existing `heuristic_pnl_worst_sum` (which is the lab's phantom-inflated upper bound). Re-running the lab on the live_v2 22-h-equivalent capture (once live_v2 finishes accumulating) will produce lab_v6 with truth_validated_pnl_worst_sum across all strategies = expected $0/day baseline (truth-anchored).
+
+### Bug fixes (post-incident)
+- **`main_paper.py::setup_paths()`**: was running explicit `Path.unlink()` on `RAW_EVENTS_PATH` + `LEDGER_PATH` + `RUN_SUMMARY_PATH` on every startup (BETWEEN state-dir creation and the append-mode re-open at L147). The append-mode protection was illusory; the unlink-by-loop upstream destroyed prior capture every restart. **Incident**: live_v2 freshly-launched at 02:53 UTC Jul 26 truncated 22.3h / 1.89M events / 6 in-memory fills previously accumulated by PID 140060. **Fix** (commit 75b697c): `setup_paths(preserve_existing: bool = True)` — when `True` (default): archive existing files to `state/archive/<name>.<ts>.pre_capture.bak` AND leave the original in place (`open(..., "a")` then appends to the existing events). When `--fresh-state` CLI flag is passed: archive-with-move then truncate (old unrecoverable behaviour now opt-in, archive makes even fresh-state recoverable). Both `phase_1a()` and `capture_only()` callsites threaded with `preserve_existing_state` flag from `args.fresh_state`.
+
+### live capture state as of 2026-07-26 03:48 UTC (live_v2 / tmux "live_v2" PIDs 220562/3)
+- raw_events.jsonl: 20.6 MB `/ 30,866 raw_msgs`.
+- capture_sec=3254 (~54 min in to the 48h target).
+- in-memory heuristic fills: 55 (phantom-inflated; truth-baseline expected 0 across the lot, pending post-KYC EIP-712 confirmation).
+- Rotated WS top-N set 7 times across the 54 min (~7.8 min/rotation), within the expected 12 min/rotation cycles the live_v2 design.
+- Continues accumulating in background; expected full raw_events.jsonl 22-h-equivalent reach in ~24h from launch (02:53 UTC Jul 27).
+
+### Verification
+- Pre-Track B test suite passes: `tests/test_poly_libs.py` + `tests/test_stat_selection.py` + `tests/test_compounding_score.py` + `tests/test_walk_forward.py` + `tests/test_paper_executor.py` — 28 tests PASS (no regression on the lib/utils).
+- Smoke test `tests/test_strategy_lab_smoke.py` PASS under the Track B patch (synthetic capture cross-match returns 0 validations on the noise-injection synthetic input → expected).
+- Network-bound `tests/test_ws_connect.py` PASSES (3 tests in 68s — live subscribe to >=3 active markets).
+- New `tests/test_live_order_placer.py` PASSES (8 tests under pre-KYC state).
+- Total 40 tests passing.
+
 ## WIP — 2026-07-24 session: Strategy Lab build + offline replay evaluator
 
 ### Added
