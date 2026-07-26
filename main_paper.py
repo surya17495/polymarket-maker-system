@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -50,12 +51,53 @@ LATENCY_SUMMARY_PATH = STATE_DIR / "latency_summary.json"
 RUN_SUMMARY_PATH = STATE_DIR / "phase1a_run_summary.json"
 
 
-def setup_paths() -> None:
+def setup_paths(preserve_existing: bool = True) -> None:
+    """Initialize state directory and ensure capture-related files exist.
+
+    Default behaviour 2026-07-26 (after "main_paper.py destroyed the 22h of
+    capture" incident): keep existing raw_events.jsonl + ledger.parquet +
+    phase1a_run_summary.json intact, no truncation. The previous behaviour
+    was ``p.unlink()`` on each (raw events jsonl + ledger + run summary) at
+    startup which permanently destroyed prior capture when the live paper
+    trader was started fresh — counter to user expectation that "more data
+    is always better" and that restarts accumulate rather than reset.
+
+    When `preserve_existing=False` is explicitly passed (= old behaviour),
+    raw_events.jsonl is moved to a timestamped archive before truncating
+    so the old capture is recoverable rather than unrecoverable-on
+    filesystem.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    archive_dir = STATE_DIR / "archive"
     for p in (RAW_EVENTS_PATH, LEDGER_PATH, RUN_SUMMARY_PATH):
-        if p.exists():
-            p.unlink()
-            log.debug("truncated %s", p)
+        if not p.exists():
+            continue
+        if preserve_existing:
+            # Move-to-archive + leave the file in place (with old content
+            # preserved). The live capture appends with `"a"` mode so
+            # subsequent writes are appended next to existing events. The
+            # dedicated `phase1a_run_summary.json` heartbeat persists from
+            # the PREVIOUS capture run but the running process writes a
+            # fresh heartbeat on top of it within the next latency-heartbeat
+            # interval (default 15s).
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_p = archive_dir / f"{p.name}.{ts}.pre_capture.bak"
+            try:
+                shutil.copy2(p, archive_p)
+                log.info("backed up %s -> %s (preserve mode)", p.name, archive_p.name)
+            except Exception as exc:
+                log.warning("backup of %s failed: %s", p, exc)
+        else:
+            # Explicit fresh-state mode: archive-with-move-then-truncate.
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_p = archive_dir / f"{p.name}.{ts}.pre.archive"
+            try:
+                p.replace(archive_p)
+                log.info("archived %s -> %s (fresh-state mode)", p.name, archive_p.name)
+            except Exception as exc:
+                log.warning("archive of %s failed: %s", p, exc)
+            log.debug("removed %s (fresh-state mode)", p)
 
 
 def load_top_asset_ids_from_parquet(n: int) -> list[str]:
@@ -112,6 +154,7 @@ async def phase_1a(
     include_initial_discovery: bool = True,
     seed_tokens: list[str] | None = None,
     enable_rotation: bool = True,
+    preserve_existing_state: bool = True,
 ) -> dict:
     """Periodic-re-discovery Phase 1A capture.
 
@@ -122,8 +165,14 @@ async def phase_1a(
     are expired; BookStore entries for dropped tokens are popped to bound memory.
 
     When enable_rotation=False, falls back to one-shot + frozen subscribe (v1 behavior).
+
+    `preserve_existing_state` (default True, set False only with explicit
+    `--fresh-state` CLI flag) -> see setup_paths(): refuses to truncate
+    raw_events.jsonl / ledger / run_summary; archives them to state/archive/
+    instead. Default-preserving behaviour added 2026-07-26 after the
+    accidental-22h-capture-truncation incident.
     """
-    setup_paths()
+    setup_paths(preserve_existing=preserve_existing_state)
     cfg_yaml = load_all_config()
     scan_cfg = load_scan_config_from_yaml(str(CONFIG_PATH))
     router_cfg = load_router_config_from_yaml(str(CONFIG_PATH))
@@ -395,9 +444,9 @@ async def phase_1a(
     return run_summary
 
 
-async def capture_only(capture_sec: float, top_n: int) -> dict:
+async def capture_only(capture_sec: float, top_n: int, preserve_existing_state: bool = True) -> dict:
     """Phase 0 raw capture only — no router, no paper_executor (kept for legacy)."""
-    setup_paths()
+    setup_paths(preserve_existing=preserve_existing_state)
 
     if not CANDIDATES_PATH.exists():
         loop_a = LoopA(out_path=str(CANDIDATES_PATH))
@@ -455,7 +504,15 @@ def main() -> None:
                         help="comma-separated list of clob_asset_ids to override scanner pick " \
                              "(debug / known-active-market override)")
     parser.add_argument("--no-rotation", action="store_true",
-                        help="disable periodic re-discovery + WS rotation (one-shot + frozen subscribe; legacy v1 behavior)")
+                         help="disable periodic re-discovery + WS rotation (one-shot + frozen subscribe; legacy v1 behavior)")
+    parser.add_argument("--fresh-state", action="store_true",
+                         help="(2026-07-25 fix) explicit override: truncate raw_events.jsonl "
+                              "+ ledger + run_summary on startup. Without this flag, the "
+                              "live capture now ARCHIVES existing state to state/archive/ "
+                              "and PRESERVES raw_events.jsonl for cross-run accumulation "
+                              "(was the default 2026-07-25 - reversed after 'that's "
+                              "the whole point of the live capture' feedback). Default "
+                              "False (preserve existing).")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -472,10 +529,11 @@ def main() -> None:
                 include_initial_discovery=not args.no_discovery,
                 seed_tokens=seed_tokens,
                 enable_rotation=not args.no_rotation,
+                preserve_existing_state=not args.fresh_state,
             )
         )
     elif args.capture_sec is not None:
-        summary = asyncio.run(capture_only(args.capture_sec, args.top_n))
+        summary = asyncio.run(capture_only(args.capture_sec, args.top_n, preserve_existing_state=not args.fresh_state))
     elif args.once:
         loop_a = LoopA(out_path=str(CANDIDATES_PATH))
         rows = loop_a.run_once()
