@@ -125,8 +125,16 @@ def _validate_fills_via_trades_truth(
                 cid_ts_list = [int(f.get("ts_utc") or 0) for f in fills
                                if f.get("market") == cid and f.get("ts_utc")]
                 if cid_ts_list:
-                    cid_min_ts_ms = max(0, min(cid_ts_list) - 300_000)
-                    cid_max_ts_ms = max(cid_ts_list) + 300_000
+                    # 2026-07-25: ±3600s window for the data-api fetch URL
+                    # (was ±300s; tested empirically: real on-chain `transactionHash`
+                    # commit timestamp lags the lab's WS-broadcast `ts_utc` by up
+                    # to 6 min, beyond the ±300s buffer; data-api filters with
+                    # minTimestamp/maxTimestamp in Unix seconds, the on-chain
+                    # commit-time trades fell outside our fetch window and never
+                    # reached the cross-match step).  Use the cross-match `ts`
+                    # tolerance (±600_000ms = 10 min) to decide match valid.
+                    cid_min_ts_ms = max(0, min(cid_ts_list) - 3_600_000)
+                    cid_max_ts_ms = max(cid_ts_list) + 3_600_000
                 else:
                     cid_min_ts_ms = None
                     cid_max_ts_ms = None
